@@ -67,6 +67,13 @@ def _area_cols(df, config):
 def _num(df, col):
     return pd.to_numeric(df[col], errors="coerce")
 
+def _find_calendar(processed_dir, snap):
+    """Tìm calendar của mốc snap, chấp nhận .csv.gz hoặc .csv."""
+    for ext in (".csv.gz", ".csv"):
+        p = Path(processed_dir) / f"calendar_{snap}{ext}"
+        if p.exists() and p.stat().st_size > 0:
+            return p
+    return None
 
 # ----------------------------------------------------------------------------
 # 8 KPI — mỗi KPI một hàm. df = bảng listings ĐÃ LỌC ~qa_any_flag
@@ -121,9 +128,9 @@ def kpi_unavailable_rate(df, config, processed_dir="data/processed"):
     keep = ["snapshot", "id"] + area_cols
     frames = []
     for snap in sorted(df["snapshot"].unique()):
-        path = Path(processed_dir) / f"calendar_{snap}.csv.gz"
-        if not path.exists():
-            logger.warning(f"Không thấy {path} — bỏ qua mốc {snap} của KPI 6")
+        path = _find_calendar(processed_dir, snap)
+        if path is None:
+            logger.warning(f"Không thấy calendar_{snap}.csv[.gz] — bỏ qua mốc {snap} của KPI 6")
             continue
         cal = pd.read_csv(path, usecols=["listing_id", "available"])
         ids = df.loc[df["snapshot"] == snap, keep].drop_duplicates("id")
@@ -162,6 +169,20 @@ def kpi_noise_rate(df, config, llm_df):
                 value=(NOISE_COL, "mean"), n=(NOISE_COL, "count"),
                 scale=100, all_period=True)
 
+def kpi_noise_complaint_rate(df, config, llm_df):
+    """KPI 7b (LLM) — Tỷ lệ review có dấu hiệu PHÀN NÀN về độ ồn (%).
+    Proxy = review nhắc độ ồn VÀ sentiment là mixed/negative.
+    Lý do: aspect_độ_ồn=1 cũng gồm cả lời khen ('quiet'), nên không thể coi là phàn nàn.
+    Hạn chế: review mixed có thể khen ồn nhưng chê chỗ khác -> đây là ước lượng cận trên."""
+    llm = _prepare_llm(df, llm_df)
+    if NOISE_COL not in llm.columns:
+        logger.warning(f"Thiếu cột {NOISE_COL} — bỏ qua KPI 7b")
+        return None
+    llm["noise_complaint"] = ((llm[NOISE_COL] == 1) &
+                              (llm["sentiment"] != "positive")).astype(float)
+    return _kpi(llm, _area_cols(llm, config), "year",
+                value=("noise_complaint", "mean"), n=("noise_complaint", "count"),
+                scale=100, all_period=True)
 
 def kpi_sentiment_score(df, config, llm_df):
     """KPI 8 (LLM) — Điểm cảm xúc TB (-1..1) = mean(positive=1, mixed=0, negative=-1),
@@ -178,7 +199,7 @@ def kpi_sentiment_score(df, config, llm_df):
 # ----------------------------------------------------------------------------
 # Bảng mô tả KPI (đưa thẳng vào báo cáo): tên → mục tiêu → công thức → đơn vị
 # ----------------------------------------------------------------------------
-def build_catalog(currency="CZK"):
+def build_catalog(currency="CZK", threshold=2):
     rows = [
         ("Nguồn cung listing", "kpi_supply.csv",
          "Đo quy mô và biến động nguồn cung Airbnb theo vùng/quý (Sở Quy hoạch)",
@@ -188,7 +209,7 @@ def build_catalog(currency="CZK"):
          "listing Entire home/apt / tổng listing × 100", "%"),
         ("Tỷ lệ chủ nhà thương mại", "kpi_multi_host_share.csv",
          "Đo mức độ tập trung nguồn cung vào chủ sở hữu nhiều căn",
-         "listing có calculated_host_listings_count >= 2 / tổng listing × 100", "%"),
+         f"listing có calculated_host_listings_count >= {threshold} / tổng listing × 100", "%"),
         (f"Giá trung vị", "kpi_median_price.csv",
          "Theo dõi mặt bằng giá, so sánh giữa các vùng (chỉ mốc có giá)",
          "median(price_clean) trên dòng qa_clean_price", f"{currency}/đêm"),
@@ -201,6 +222,9 @@ def build_catalog(currency="CZK"):
         ("Tỷ lệ review nhắc độ ồn (LLM)", "kpi_noise_rate.csv",
          "Xác định điểm nóng tiếng ồn để tuần tra/giám sát",
          "mean(aspect_độ_ồn) × 100", "%"),
+        ("Tỷ lệ review phàn nàn độ ồn (LLM, proxy)", "kpi_noise_complaint_rate.csv",
+         "Xác định điểm nóng tiếng ồn thực sự để tuần tra/giám sát",
+         "review nhắc độ ồn & sentiment ≠ positive / tổng review × 100", "%"),
         ("Điểm cảm xúc trung bình (LLM)", "kpi_sentiment_score.csv",
          "Đo mức hài lòng của du khách theo vùng và loại phòng",
          "mean(positive=1, mixed=0, negative=-1)", "điểm (-1..1)"),
@@ -244,7 +268,9 @@ def run_kpi(config, df=None, data_dir=None, report_dir="reports"):
     if llm_path.exists():
         llm_df = pd.read_csv(llm_path)
         results["kpi_noise_rate"] = kpi_noise_rate(clean, config, llm_df)
+        results["kpi_noise_complaint_rate"] = kpi_noise_complaint_rate(clean, config, llm_df)
         results["kpi_sentiment_score"] = kpi_sentiment_score(clean, config, llm_df)
+
     else:
         logger.warning(f"Không thấy {llm_path} — bỏ qua 2 KPI dùng LLM")
 
@@ -255,7 +281,8 @@ def run_kpi(config, df=None, data_dir=None, report_dir="reports"):
         res.to_csv(out_dir / f"{name}.csv", index=False, encoding="utf-8")
         logger.info(f"[KPI] Đã ghi {name}.csv ({len(res)} dòng)")
 
-    build_catalog(config.get("currency", "CZK")).to_csv(
+    thr = config.get("kpi", {}).get("commercial_threshold", 2)
+    build_catalog(config.get("currency", "CZK"), thr).to_csv(
         out_dir / "kpi_catalog.csv", index=False, encoding="utf-8-sig")
     return results
 
